@@ -1435,6 +1435,115 @@ int cbm_remove_codex_mcp(const char *config_path) {
     return rc;
 }
 
+/* ── SessionStart reminder hook (Codex / Gemini / Antigravity) ──────
+ * Same methodology as the Claude Code SessionStart hook: a non-blocking
+ * lifecycle hook whose stdout is injected as session context, reminding the
+ * agent to use codebase-memory-mcp graph tools first. The command is written
+ * so it is valid both inside a TOML single-quoted literal (Codex config.toml)
+ * and a JSON string (Gemini settings.json) — i.e. it contains NO single quotes
+ * and NO newlines. (issues #330 + Gemini/Antigravity parity) */
+#define CMM_SESSION_REMINDER_CMD                                                    \
+    "echo \"Code discovery: prefer codebase-memory-mcp (search_graph, trace_path, " \
+    "get_code_snippet, query_graph, search_code) over grep/file-read; run "         \
+    "index_repository first if the project is not indexed.\""
+
+/* Sentinel-delimited block so upsert/remove are robust to the nested TOML
+ * array-of-tables (which both start with '['). */
+#define CODEX_HOOK_BEGIN "# >>> codebase-memory-mcp SessionStart >>>"
+#define CODEX_HOOK_END "# <<< codebase-memory-mcp SessionStart <<<"
+
+/* Splice out an existing [CODEX_HOOK_BEGIN .. CODEX_HOOK_END] block (inclusive,
+ * plus a leading newline). Returns a newly-malloc'd string the caller frees, or
+ * NULL if no block was present (content is left untouched). */
+static char *codex_hook_strip(const char *content) {
+    char *begin = strstr(content, CODEX_HOOK_BEGIN);
+    if (!begin) {
+        return NULL;
+    }
+    char *end = strstr(begin, CODEX_HOOK_END);
+    if (!end) {
+        return NULL;
+    }
+    end += strlen(CODEX_HOOK_END);
+    if (*end == '\n') {
+        end++;
+    }
+    /* Drop one leading newline before the block, if any. */
+    char *cut = begin;
+    if (cut > content && *(cut - CLI_SKIP_ONE) == '\n') {
+        cut--;
+    }
+    size_t prefix_len = (size_t)(cut - content);
+    size_t suffix_len = strlen(end);
+    char *out = malloc(prefix_len + suffix_len + CLI_SKIP_ONE);
+    if (!out) {
+        return NULL;
+    }
+    memcpy(out, content, prefix_len);
+    memcpy(out + prefix_len, end, suffix_len);
+    out[prefix_len + suffix_len] = '\0';
+    return out;
+}
+
+/* Install/update the Codex SessionStart reminder hook in config.toml. */
+int cbm_upsert_codex_hooks(const char *config_path) {
+    if (!config_path) {
+        return CLI_ERR;
+    }
+    char block[CLI_BUF_2K];
+    snprintf(block, sizeof(block),
+             "\n" CODEX_HOOK_BEGIN "\n"
+             "[[hooks.SessionStart]]\n"
+             "matcher = \"startup|resume|clear|compact\"\n\n"
+             "[[hooks.SessionStart.hooks]]\n"
+             "type = \"command\"\n"
+             "command = '%s'\n" CODEX_HOOK_END "\n",
+             CMM_SESSION_REMINDER_CMD);
+
+    size_t len = 0;
+    char *content = read_file_str(config_path, &len);
+    if (!content) {
+        return write_file_str(config_path, block + CLI_SKIP_ONE); /* skip leading newline */
+    }
+    char *stripped = codex_hook_strip(content);
+    const char *base = stripped ? stripped : content;
+    size_t base_len = strlen(base);
+    char *result = malloc(base_len + strlen(block) + CLI_SKIP_ONE);
+    if (!result) {
+        free(content);
+        free(stripped);
+        return CLI_ERR;
+    }
+    memcpy(result, base, base_len);
+    memcpy(result + base_len, block, strlen(block));
+    result[base_len + strlen(block)] = '\0';
+    int rc = write_file_str(config_path, result);
+    free(content);
+    free(stripped);
+    free(result);
+    return rc;
+}
+
+int cbm_remove_codex_hooks(const char *config_path) {
+    if (!config_path) {
+        return CLI_ERR;
+    }
+    size_t len = 0;
+    char *content = read_file_str(config_path, &len);
+    if (!content) {
+        return CLI_TRUE;
+    }
+    char *stripped = codex_hook_strip(content);
+    if (!stripped) {
+        free(content);
+        return CLI_TRUE; /* nothing to remove */
+    }
+    int rc = write_file_str(config_path, stripped);
+    free(content);
+    free(stripped);
+    return rc;
+}
+
 /* ── OpenCode MCP config (JSON with "mcp" key) ───────────────── */
 
 int cbm_upsert_opencode_mcp(const char *binary_path, const char *config_path) {
@@ -1713,6 +1822,12 @@ static int remove_hooks_json(hooks_remove_args_t args) {
         }
     }
 
+    /* Prune the event key once its array is empty, so removing our hook leaves
+     * no stale "<Event>": [] cruft behind. */
+    if (yyjson_mut_arr_size(event_arr) == 0) {
+        yyjson_mut_obj_remove_key(hooks, hook_event);
+    }
+
     int rc = write_json_file(settings_path, mdoc);
     yyjson_mut_doc_free(mdoc);
     return rc;
@@ -1895,6 +2010,29 @@ int cbm_remove_gemini_hooks(const char *settings_path) {
         .hook_event = "BeforeTool",
         .matcher_str = GEMINI_HOOK_MATCHER,
         .old_matchers = cmm_gemini_old_matchers,
+    });
+}
+
+/* Gemini CLI / Antigravity SessionStart reminder. settings.json uses the same
+ * hooks.<Event>[].hooks[] JSON shape as Claude, so it reuses upsert_hooks_json.
+ * The SessionStart matcher is advisory in Gemini (it does not filter lifecycle
+ * sources), so a single "startup" entry fires on startup/resume/clear. The
+ * command's stdout is injected as session context. (Gemini/Antigravity parity
+ * with the Claude/Codex SessionStart reminder.) */
+int cbm_upsert_gemini_session_hooks(const char *settings_path) {
+    return upsert_hooks_json((hooks_upsert_args_t){
+        .settings_path = settings_path,
+        .hook_event = "SessionStart",
+        .matcher_str = "startup",
+        .command_str = CMM_SESSION_REMINDER_CMD,
+    });
+}
+
+int cbm_remove_gemini_session_hooks(const char *settings_path) {
+    return remove_hooks_json((hooks_remove_args_t){
+        .settings_path = settings_path,
+        .hook_event = "SessionStart",
+        .matcher_str = "startup",
     });
 }
 
@@ -2919,12 +3057,14 @@ static void install_gemini_config(const char *home, const char *binary_path, boo
     install_generic_agent_config("Gemini CLI", binary_path, cp, ip, dry_run,
                                  cbm_install_editor_mcp);
     if (g_install_plan) {
-        return; /* config recorded by install_generic_agent_config above */
+        plan_record("Gemini CLI", "hook", cp); /* BeforeTool + SessionStart in settings.json */
+        return;
     }
     if (!dry_run) {
         cbm_upsert_gemini_hooks(cp);
+        cbm_upsert_gemini_session_hooks(cp);
     }
-    printf("  hooks: BeforeTool (grep/file search reminder)\n");
+    printf("  hooks: BeforeTool + SessionStart (codebase-memory-mcp reminder)\n");
 }
 
 static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const char *home,
@@ -2936,6 +3076,14 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
         snprintf(ip, sizeof(ip), "%s/.codex/AGENTS.md", home);
         install_generic_agent_config("Codex CLI", binary_path, cp, ip, dry_run,
                                      cbm_upsert_codex_mcp);
+        if (g_install_plan) {
+            plan_record("Codex CLI", "hook", cp);
+        } else {
+            if (!dry_run) {
+                cbm_upsert_codex_hooks(cp);
+            }
+            printf("  hooks: SessionStart (codebase-memory-mcp reminder)\n");
+        }
     }
     if (agents->gemini) {
         install_gemini_config(home, binary_path, dry_run);
@@ -2955,6 +3103,18 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
         snprintf(ip, sizeof(ip), "%s/.gemini/antigravity/AGENTS.md", home);
         install_generic_agent_config("Antigravity", binary_path, cp, ip, dry_run,
                                      cbm_upsert_antigravity_mcp);
+        /* Antigravity shares Gemini's hooks JSON schema; its settings live in
+         * the antigravity config dir. */
+        char sp[CLI_BUF_1K];
+        snprintf(sp, sizeof(sp), "%s/.gemini/antigravity/settings.json", home);
+        if (g_install_plan) {
+            plan_record("Antigravity", "hook", sp);
+        } else {
+            if (!dry_run) {
+                cbm_upsert_gemini_session_hooks(sp);
+            }
+            printf("  hooks: SessionStart (codebase-memory-mcp reminder)\n");
+        }
     }
     if (agents->aider) {
         char ip[CLI_BUF_1K];
@@ -3351,6 +3511,7 @@ static void uninstall_gemini_config(const char *home, bool dry_run) {
     if (!dry_run) {
         cbm_remove_editor_mcp(cp);
         cbm_remove_gemini_hooks(cp);
+        cbm_remove_gemini_session_hooks(cp);
         cbm_remove_instructions(ip);
     }
     printf("Gemini CLI: removed MCP config + hooks + instructions\n");
@@ -3365,6 +3526,9 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
         snprintf(ip, sizeof(ip), "%s/.codex/AGENTS.md", home);
         uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Codex CLI", cp, ip}, dry_run,
                                   cbm_remove_codex_mcp);
+        if (!dry_run) {
+            cbm_remove_codex_hooks(cp);
+        }
     }
     if (agents->gemini) {
         uninstall_gemini_config(home, dry_run);
@@ -3384,6 +3548,11 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
         snprintf(ip, sizeof(ip), "%s/.gemini/antigravity/AGENTS.md", home);
         uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Antigravity", cp, ip}, dry_run,
                                   cbm_remove_antigravity_mcp);
+        if (!dry_run) {
+            char sp[CLI_BUF_1K];
+            snprintf(sp, sizeof(sp), "%s/.gemini/antigravity/settings.json", home);
+            cbm_remove_gemini_session_hooks(sp);
+        }
     }
     if (agents->aider) {
         char ip[CLI_BUF_1K];

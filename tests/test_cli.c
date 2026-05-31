@@ -1538,6 +1538,65 @@ TEST(cli_install_plan_receipt_no_mutation_issue388) {
     PASS();
 }
 
+/* issue #330: Codex SessionStart reminder hook in config.toml — installed,
+ * idempotent, preserves other content, and cleanly removed. */
+TEST(cli_codex_session_hook_issue330) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codexhook-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        SKIP("cbm_mkdtemp failed");
+
+    char cfg[512];
+    snprintf(cfg, sizeof(cfg), "%s/config.toml", tmpdir);
+    write_test_file(cfg, "[mcp_servers.other]\ncommand = \"x\"\n");
+
+    ASSERT_EQ(cbm_upsert_codex_hooks(cfg), 0);
+    const char *d = read_test_file(cfg);
+    ASSERT_NOT_NULL(d);
+    ASSERT(strstr(d, "[[hooks.SessionStart]]") != NULL);
+    ASSERT(strstr(d, "[[hooks.SessionStart.hooks]]") != NULL);
+    ASSERT(strstr(d, "search_graph") != NULL);
+    ASSERT(strstr(d, "[mcp_servers.other]") != NULL); /* pre-existing content preserved */
+    /* Idempotent: a second upsert leaves exactly ONE hook block. */
+    ASSERT_EQ(cbm_upsert_codex_hooks(cfg), 0);
+    d = read_test_file(cfg);
+    const char *first = strstr(d, "[[hooks.SessionStart]]");
+    ASSERT_NOT_NULL(first);
+    ASSERT_NULL(strstr(first + 1, "[[hooks.SessionStart]]"));
+
+    ASSERT_EQ(cbm_remove_codex_hooks(cfg), 0);
+    d = read_test_file(cfg);
+    ASSERT_NULL(strstr(d, "hooks.SessionStart"));
+    ASSERT(strstr(d, "[mcp_servers.other]") != NULL); /* still preserved after removal */
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+/* Gemini/Antigravity SessionStart reminder parity (settings.json JSON path). */
+TEST(cli_gemini_session_hook_parity) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-gemhook-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        SKIP("cbm_mkdtemp failed");
+
+    char cfg[512];
+    snprintf(cfg, sizeof(cfg), "%s/settings.json", tmpdir);
+
+    ASSERT_EQ(cbm_upsert_gemini_session_hooks(cfg), 0);
+    const char *d = read_test_file(cfg);
+    ASSERT_NOT_NULL(d);
+    ASSERT(strstr(d, "SessionStart") != NULL);
+    ASSERT(strstr(d, "search_graph") != NULL);
+
+    ASSERT_EQ(cbm_remove_gemini_session_hooks(cfg), 0);
+    d = read_test_file(cfg);
+    ASSERT_NULL(strstr(d, "SessionStart"));
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 TEST(cli_detect_agents_finds_gemini) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-detect-XXXXXX");
@@ -2609,6 +2668,8 @@ SUITE(cli) {
     RUN_TEST(cli_detect_agents_finds_codex);
     RUN_TEST(cli_detect_agents_finds_cursor_issue222);
     RUN_TEST(cli_install_plan_receipt_no_mutation_issue388);
+    RUN_TEST(cli_codex_session_hook_issue330);
+    RUN_TEST(cli_gemini_session_hook_parity);
     RUN_TEST(cli_detect_agents_finds_gemini);
     RUN_TEST(cli_detect_agents_finds_zed);
     RUN_TEST(cli_detect_agents_finds_antigravity);

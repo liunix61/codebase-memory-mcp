@@ -335,11 +335,11 @@ Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` 
 | Agent | MCP Config | Instructions | Hooks |
 |-------|-----------|-------------|-------|
 | Claude Code | `.claude/.mcp.json` | 4 Skills | PreToolUse (Grep/Glob graph augment, non-blocking) |
-| Codex CLI | `.codex/config.toml` | `.codex/AGENTS.md` | — |
-| Gemini CLI | `.gemini/settings.json` | `.gemini/GEMINI.md` | BeforeTool (grep reminder) |
+| Codex CLI | `.codex/config.toml` | `.codex/AGENTS.md` | SessionStart reminder |
+| Gemini CLI | `.gemini/settings.json` | `.gemini/GEMINI.md` | BeforeTool (grep reminder) + SessionStart reminder |
 | Zed | `settings.json` (JSONC) | — | — |
 | OpenCode | `opencode.json` | `AGENTS.md` | — |
-| Antigravity | `mcp_config.json` | `AGENTS.md` | — |
+| Antigravity | `mcp_config.json` | `AGENTS.md` | SessionStart reminder |
 | Aider | — | `CONVENTIONS.md` | — |
 | KiloCode | `mcp_settings.json` | `~/.kilocode/rules/` | — |
 | VS Code | `Code/User/mcp.json` | — | — |
@@ -351,7 +351,9 @@ For Claude Code, the `PreToolUse` hook intercepts `Grep`/`Glob` (never `Read` �
 gating `Read` breaks the read-before-edit invariant) and, when the search
 token matches indexed symbols, injects them as `additionalContext` via
 `search_graph` so the agent gets structured context alongside its normal
-search results. For Gemini CLI, `BeforeTool` prints a short reminder.
+search results. For Codex, Gemini CLI, and Antigravity, a `SessionStart` hook
+injects a one-line code-discovery reminder as session context (Gemini CLI also
+keeps its `BeforeTool` reminder).
 The installed Claude shim file is named `cbm-code-discovery-gate` for
 backward compatibility with existing installs; despite the legacy name it
 never gates and never blocks.
