@@ -49,13 +49,11 @@ enum {
     ST_MIN_INDEGREE = 3,
     ST_MAX_PATH_DEPTH = 3,
     ST_MAX_ITERATIONS = 10,
-    ST_GRAPH_SEED_MULT = 1000,
     ST_MAX_SECTIONS = 16,
     ST_METHOD_PROP_LEN = 8,
     ST_PATH_PROP_LEN = 6,
     ST_HANDLER_PROP_LEN = 9,
 };
-#define ST_WEIGHT_2 2.0
 
 #define SLEN(s) (sizeof(s) - 1)
 #include "store/store.h"
@@ -4137,219 +4135,489 @@ static void louvain_build_weights(const int64_t *nodes, int n, const cbm_louvain
     *out_wn = wn;
 }
 
-/* Add a bidirectional edge to adjacency lists. */
-static void adj_add_edge(int **adj, double **adj_w, int *adj_n, int *adj_cap, int si, int di,
-                         double w) {
-    if (adj_n[si] >= adj_cap[si]) {
-        int new_cap = adj_cap[si] ? adj_cap[si] * ST_GROWTH : ST_INIT_CAP_4;
-        int *new_adj = safe_realloc(adj[si], new_cap * sizeof(int));
-        double *new_w = safe_realloc(adj_w[si], new_cap * sizeof(double));
-        /* Zero-init new slots to satisfy static analyzer */
-        for (int k = adj_cap[si]; k < new_cap; k++) {
-            new_adj[k] = 0;
-            new_w[k] = 0.0;
-        }
-        adj[si] = new_adj;
-        adj_w[si] = new_w;
-        adj_cap[si] = new_cap;
-    }
-    adj[si][adj_n[si]] = di;
-    adj_w[si][adj_n[si]] = w;
-    adj_n[si]++;
+enum { LEIDEN_MAX_LEVELS = 64, LEIDEN_MOVE_PASS_CAP = 100 };
 
-    if (adj_n[di] >= adj_cap[di]) {
-        adj_cap[di] = adj_cap[di] ? adj_cap[di] * ST_GROWTH : ST_INIT_CAP_4;
-        adj[di] = safe_realloc(adj[di], adj_cap[di] * sizeof(int));
-        adj_w[di] = safe_realloc(adj_w[di], adj_cap[di] * sizeof(double));
-    }
-    adj[di][adj_n[di]] = si;
-    adj_w[di][adj_n[di]] = w;
-    adj_n[di]++;
+/* Weighted undirected graph in CSR form. Each undirected edge is stored as
+ * two directed entries; k[i] is the weighted degree of node i. Self-loops are
+ * never materialised — an aggregate node's intra-community weight is folded
+ * into k[i] (which is preserved across levels), while nbr/w hold only
+ * inter-community edges. The modularity gain therefore uses k[] for the
+ * null-model term and nbr/w for connectivity, so intra weight affects the
+ * degree but is never mistaken for an edge to another community. */
+typedef struct {
+    int n;
+    int *off;  /* CSR offsets, length n + 1 */
+    int *nbr;  /* neighbour indices, length off[n] */
+    double *w; /* edge weights aligned with nbr */
+    double *k; /* weighted degree per node */
+} cbm_lg_t;
+
+static void lg_free(cbm_lg_t *g) {
+    free(g->off);
+    free(g->nbr);
+    free(g->w);
+    free(g->k);
+    g->off = NULL;
+    g->nbr = NULL;
+    g->w = NULL;
+    g->k = NULL;
 }
 
-/* Run one Louvain iteration. Returns true if any node moved. */
-/* Linear congruential generator (glibc constants) */
-#define LCG_MULTIPLIER 1103515245U
-#define LCG_INCREMENT 12345U
-
-static bool louvain_iteration(int n, int **adj, double **adj_w, const int *adj_n, int *community,
-                              const double *degree, double total_weight, int iter) {
-    bool improved = false;
-
-    double *comm_degree = calloc(n, sizeof(double));
+/* Build a CSR graph from a deduplicated undirected edge list. */
+static int lg_build(int n, const int *wsi, const int *wdi, const double *ww, int wn,
+                    cbm_lg_t *out) {
+    int *off = calloc((size_t)n + 1, sizeof(int));
+    double *k = calloc((size_t)n, sizeof(double));
+    int *fill = malloc((size_t)n * sizeof(int));
+    if (!off || !k || !fill) {
+        free(off);
+        free(k);
+        free(fill);
+        return CBM_NOT_FOUND;
+    }
+    for (int e = 0; e < wn; e++) {
+        off[wsi[e] + 1]++;
+        off[wdi[e] + 1]++;
+    }
     for (int i = 0; i < n; i++) {
-        comm_degree[community[i]] += degree[i];
+        off[i + 1] += off[i];
     }
+    int total = off[n];
+    int *nbr = malloc((size_t)(total > 0 ? total : 1) * sizeof(int));
+    double *w = malloc((size_t)(total > 0 ? total : 1) * sizeof(double));
+    if (!nbr || !w) {
+        free(off);
+        free(k);
+        free(fill);
+        free(nbr);
+        free(w);
+        return CBM_NOT_FOUND;
+    }
+    memcpy(fill, off, (size_t)n * sizeof(int));
+    for (int e = 0; e < wn; e++) {
+        int a = wsi[e];
+        int b = wdi[e];
+        double we = ww[e];
+        nbr[fill[a]] = b;
+        w[fill[a]] = we;
+        fill[a]++;
+        nbr[fill[b]] = a;
+        w[fill[b]] = we;
+        fill[b]++;
+        k[a] += we;
+        k[b] += we;
+    }
+    free(fill);
+    out->n = n;
+    out->off = off;
+    out->nbr = nbr;
+    out->w = w;
+    out->k = k;
+    return CBM_STORE_OK;
+}
 
-    int *order = calloc(n, sizeof(int));
+/* Local-moving phase: greedily move each node to the neighbouring community
+ * with the highest modularity gain, using a work queue seeded with every node
+ * and re-queueing only the neighbours of a node that actually moved. Mutates
+ * comm[] in place. */
+static void leiden_move(const cbm_lg_t *g, int *comm, double gamma, double twom) {
+    int n = g->n;
+    double *stot = calloc((size_t)n, sizeof(double));
+    double *acc = calloc((size_t)n, sizeof(double));
+    int *queue = malloc((size_t)n * sizeof(int));
+    int *dirty = malloc((size_t)n * sizeof(int));
+    bool *inq = calloc((size_t)n, sizeof(bool));
+    if (!stot || !acc || !queue || !dirty || !inq) {
+        free(stot);
+        free(acc);
+        free(queue);
+        free(dirty);
+        free(inq);
+        return;
+    }
     for (int i = 0; i < n; i++) {
-        order[i] = i;
+        stot[comm[i]] += g->k[i];
+        queue[i] = i;
+        inq[i] = true;
     }
-    unsigned int seed = (unsigned int)((iter * ST_GRAPH_SEED_MULT) + n);
-    for (int i = n - SKIP_ONE; i > 0; i--) {
-        seed = (seed * LCG_MULTIPLIER) + LCG_INCREMENT;
-        int j = (int)((seed >> ST_BUF_16) % (unsigned int)(i + SKIP_ONE));
-        int tmp = order[i];
-        order[i] = order[j];
-        order[j] = tmp;
-    }
-
-    for (int oi = 0; oi < n; oi++) {
-        int i = order[oi];
-        int cur_comm = community[i];
-
-        double *nc_weight = calloc(n, sizeof(double));
-        bool *nc_seen = calloc(n, sizeof(bool));
-        for (int j = 0; j < adj_n[i]; j++) {
-            int nc = community[adj[i][j]];
-            nc_weight[nc] += adj_w[i][j];
-            nc_seen[nc] = true;
-        }
-
-        comm_degree[cur_comm] -= degree[i];
-
-        int best_comm = cur_comm;
-        double best_gain = 0.0;
-        for (int c = 0; c < n; c++) {
-            if (!nc_seen[c]) {
+    int qhead = 0;
+    int qcount = n;
+    long cap = (long)n * LEIDEN_MOVE_PASS_CAP + LEIDEN_MAX_LEVELS;
+    while (qcount > 0 && cap-- > 0) {
+        int v = queue[qhead];
+        qhead = (qhead + 1) % n;
+        qcount--;
+        inq[v] = false;
+        int cv = comm[v];
+        int ndirty = 0;
+        for (int e = g->off[v]; e < g->off[v + 1]; e++) {
+            int u = g->nbr[e];
+            if (u == v) {
                 continue;
             }
-            double gain =
-                nc_weight[c] - (degree[i] * comm_degree[c] / (ST_WEIGHT_2 * total_weight));
+            int cu = comm[u];
+            if (acc[cu] == 0.0) {
+                dirty[ndirty++] = cu;
+            }
+            acc[cu] += g->w[e];
+        }
+        stot[cv] -= g->k[v];
+        double kv = g->k[v];
+        int best_c = cv;
+        double best_gain = acc[cv] - gamma * kv * stot[cv] / twom;
+        for (int d = 0; d < ndirty; d++) {
+            int c = dirty[d];
+            double gain = acc[c] - gamma * kv * stot[c] / twom;
             if (gain > best_gain) {
                 best_gain = gain;
-                best_comm = c;
+                best_c = c;
             }
         }
-
-        double cur_gain = nc_weight[cur_comm] -
-                          (degree[i] * comm_degree[cur_comm] / (ST_WEIGHT_2 * total_weight));
-        if (cur_gain >= best_gain) {
-            best_comm = cur_comm;
+        stot[best_c] += kv;
+        comm[v] = best_c;
+        if (best_c != cv) {
+            for (int e = g->off[v]; e < g->off[v + 1]; e++) {
+                int u = g->nbr[e];
+                if (comm[u] != best_c && !inq[u] && qcount < n) {
+                    queue[(qhead + qcount) % n] = u;
+                    qcount++;
+                    inq[u] = true;
+                }
+            }
         }
-
-        community[i] = best_comm;
-        comm_degree[best_comm] += degree[i];
-
-        if (best_comm != cur_comm) {
-            improved = true;
+        for (int d = 0; d < ndirty; d++) {
+            acc[dirty[d]] = 0.0;
         }
-
-        free(nc_weight);
-        free(nc_seen);
     }
-    free(order);
-    free(comm_degree);
-    return improved;
+    free(stot);
+    free(acc);
+    free(queue);
+    free(dirty);
+    free(inq);
 }
 
-static void louvain_free_adj(int **adj, double **adj_w, int *adj_n, int *adj_cap, int n) {
+/* Compact community labels in comm[] to the dense range [0, returned count). */
+static int leiden_relabel(int *comm, int n) {
+    int *map = malloc((size_t)n * sizeof(int));
+    if (!map) {
+        return n;
+    }
     for (int i = 0; i < n; i++) {
-        free(adj[i]);
-        free(adj_w[i]);
+        map[i] = CBM_NOT_FOUND;
     }
-    free(adj);
-    free(adj_w);
-    free(adj_n);
-    free(adj_cap);
+    int next = 0;
+    for (int i = 0; i < n; i++) {
+        int c = comm[i];
+        if (map[c] == CBM_NOT_FOUND) {
+            map[c] = next++;
+        }
+        comm[i] = map[c];
+    }
+    free(map);
+    return next;
 }
 
-int cbm_louvain(const int64_t *nodes, int node_count, const cbm_louvain_edge_t *edges,
-                int edge_count, cbm_louvain_result_t **out, int *out_count) {
+/* Refinement phase: within each move-phase community, merge singleton nodes
+ * into the best connected sub-community (positive modularity gain, edge must
+ * exist). This re-derives communities bottom-up so each one is guaranteed
+ * internally connected — the defect single-level Louvain suffers from, which
+ * fragments the graph into hundreds of tiny noisy clusters. Writes
+ * sub-community labels into refined[] and returns their count. */
+static int leiden_refine(const cbm_lg_t *g, const int *comm, double gamma, double twom,
+                         int *refined) {
+    int n = g->n;
+    double *stot = calloc((size_t)n, sizeof(double));
+    double *acc = calloc((size_t)n, sizeof(double));
+    int *rsize = malloc((size_t)n * sizeof(int));
+    int *dirty = malloc((size_t)n * sizeof(int));
+    if (!stot || !acc || !rsize || !dirty) {
+        free(stot);
+        free(acc);
+        free(rsize);
+        free(dirty);
+        for (int i = 0; i < n; i++) {
+            refined[i] = i;
+        }
+        return leiden_relabel(refined, n);
+    }
+    for (int i = 0; i < n; i++) {
+        refined[i] = i;
+        stot[i] = g->k[i];
+        rsize[i] = 1;
+    }
+    for (int v = 0; v < n; v++) {
+        if (rsize[refined[v]] != 1) {
+            continue; /* only singletons merge, per the refinement rule */
+        }
+        int cv = comm[v];
+        int ndirty = 0;
+        for (int e = g->off[v]; e < g->off[v + 1]; e++) {
+            int u = g->nbr[e];
+            if (u == v || comm[u] != cv) {
+                continue; /* stay within the move-phase community */
+            }
+            int ru = refined[u];
+            if (acc[ru] == 0.0) {
+                dirty[ndirty++] = ru;
+            }
+            acc[ru] += g->w[e];
+        }
+        int rv = refined[v];
+        double kv = g->k[v];
+        stot[rv] -= kv;
+        int best_r = rv;
+        double best_gain = 0.0;
+        for (int d = 0; d < ndirty; d++) {
+            int r = dirty[d];
+            if (r == rv) {
+                continue;
+            }
+            double gain = acc[r] - gamma * kv * stot[r] / twom;
+            if (gain > best_gain) {
+                best_gain = gain;
+                best_r = r;
+            }
+        }
+        if (best_r != rv) {
+            refined[v] = best_r;
+            stot[best_r] += kv;
+            rsize[best_r]++;
+            rsize[rv]--;
+        } else {
+            stot[rv] += kv;
+        }
+        for (int d = 0; d < ndirty; d++) {
+            acc[dirty[d]] = 0.0;
+        }
+    }
+    free(stot);
+    free(acc);
+    free(rsize);
+    free(dirty);
+    return leiden_relabel(refined, n);
+}
+
+/* Aggregation phase: collapse each refined sub-community into a single node.
+ * Builds the coarser graph in *out and records, for each aggregate node, the
+ * move-phase community it belonged to in seed[] so the next level starts from
+ * the coarse structure rather than from singletons. */
+static int leiden_aggregate(const cbm_lg_t *g, const int *refined, int r_count, const int *comm,
+                            cbm_lg_t *out, int *seed) {
+    int n = g->n;
+    double *k2 = calloc((size_t)r_count, sizeof(double));
+    int *gcount = calloc((size_t)r_count, sizeof(int));
+    int *gstart = malloc(((size_t)r_count + 1) * sizeof(int));
+    int *members = malloc((size_t)n * sizeof(int));
+    int *fill = malloc((size_t)r_count * sizeof(int));
+    double *acc = calloc((size_t)r_count, sizeof(double));
+    int *dirty = malloc((size_t)r_count * sizeof(int));
+    int *off2 = malloc(((size_t)r_count + 1) * sizeof(int));
+    if (!k2 || !gcount || !gstart || !members || !fill || !acc || !dirty || !off2) {
+        free(k2);
+        free(gcount);
+        free(gstart);
+        free(members);
+        free(fill);
+        free(acc);
+        free(dirty);
+        free(off2);
+        return CBM_NOT_FOUND;
+    }
+    for (int r = 0; r < r_count; r++) {
+        seed[r] = CBM_NOT_FOUND;
+    }
+    for (int i = 0; i < n; i++) {
+        int r = refined[i];
+        k2[r] += g->k[i];
+        gcount[r]++;
+        if (seed[r] == CBM_NOT_FOUND) {
+            seed[r] = comm[i];
+        }
+    }
+    gstart[0] = 0;
+    for (int r = 0; r < r_count; r++) {
+        gstart[r + 1] = gstart[r] + gcount[r];
+        fill[r] = gstart[r];
+    }
+    for (int i = 0; i < n; i++) {
+        members[fill[refined[i]]++] = i;
+    }
+    /* Pass 1: count distinct inter-community neighbours per aggregate node. */
+    off2[0] = 0;
+    for (int r = 0; r < r_count; r++) {
+        int nd = 0;
+        for (int m = gstart[r]; m < gstart[r + 1]; m++) {
+            int i = members[m];
+            for (int e = g->off[i]; e < g->off[i + 1]; e++) {
+                int rb = refined[g->nbr[e]];
+                if (rb == r || acc[rb] != 0.0) {
+                    continue;
+                }
+                acc[rb] = 1.0;
+                dirty[nd++] = rb;
+            }
+        }
+        off2[r + 1] = off2[r] + nd;
+        for (int d = 0; d < nd; d++) {
+            acc[dirty[d]] = 0.0;
+        }
+    }
+    int total = off2[r_count];
+    int *nbr2 = malloc((size_t)(total > 0 ? total : 1) * sizeof(int));
+    double *w2 = malloc((size_t)(total > 0 ? total : 1) * sizeof(double));
+    if (!nbr2 || !w2) {
+        free(k2);
+        free(gcount);
+        free(gstart);
+        free(members);
+        free(fill);
+        free(acc);
+        free(dirty);
+        free(off2);
+        free(nbr2);
+        free(w2);
+        return CBM_NOT_FOUND;
+    }
+    /* Pass 2: accumulate inter-community edge weights. */
+    for (int r = 0; r < r_count; r++) {
+        int nd = 0;
+        for (int m = gstart[r]; m < gstart[r + 1]; m++) {
+            int i = members[m];
+            for (int e = g->off[i]; e < g->off[i + 1]; e++) {
+                int rb = refined[g->nbr[e]];
+                if (rb == r) {
+                    continue;
+                }
+                if (acc[rb] == 0.0) {
+                    dirty[nd++] = rb;
+                }
+                acc[rb] += g->w[e];
+            }
+        }
+        int base = off2[r];
+        for (int d = 0; d < nd; d++) {
+            nbr2[base + d] = dirty[d];
+            w2[base + d] = acc[dirty[d]];
+            acc[dirty[d]] = 0.0;
+        }
+    }
+    free(gcount);
+    free(gstart);
+    free(members);
+    free(fill);
+    free(acc);
+    free(dirty);
+    out->n = r_count;
+    out->off = off2;
+    out->nbr = nbr2;
+    out->w = w2;
+    out->k = k2;
+    return CBM_STORE_OK;
+}
+
+int cbm_leiden(const int64_t *nodes, int node_count, const cbm_louvain_edge_t *edges,
+               int edge_count, double resolution, cbm_louvain_result_t **out, int *out_count) {
     if (node_count <= 0) {
         *out = NULL;
         *out_count = 0;
         return CBM_STORE_OK;
     }
-
     int n = node_count;
+    double gamma = resolution > 0.0 ? resolution : 1.0;
 
-    /* Build deduplicated edge weights */
+    cbm_louvain_result_t *result = malloc((size_t)n * sizeof(*result));
+    if (!result) {
+        return CBM_NOT_FOUND;
+    }
+    for (int i = 0; i < n; i++) {
+        result[i].node_id = nodes[i];
+        result[i].community = i;
+    }
+
+    /* Build deduplicated undirected edge weights, then a CSR graph. */
     int *wsi;
     int *wdi;
     double *ww;
     int wn;
     louvain_build_weights(nodes, n, edges, edge_count, &wsi, &wdi, &ww, &wn);
-
-    /* Build adjacency lists */
-    int **adj = calloc(n, sizeof(int *));
-    double **adj_w = calloc(n, sizeof(double *));
-    int *adj_n = calloc(n, sizeof(int));
-    int *adj_cap = calloc(n, sizeof(int));
-    if (!adj || !adj_w || !adj_n || !adj_cap) {
-        free(adj);
-        free(adj_w);
-        free(adj_n);
-        free(adj_cap);
-        free(wsi);
-        free(wdi);
-        free(ww);
-        return CBM_NOT_FOUND;
-    }
-
-    double total_weight = 0;
-    for (int i = 0; i < wn; i++) {
-        total_weight += ww[i];
-        adj_add_edge(adj, adj_w, adj_n, adj_cap, wsi[i], wdi[i], ww[i]);
-    }
+    cbm_lg_t g;
+    int built = (wn > 0) ? lg_build(n, wsi, wdi, ww, wn, &g) : CBM_NOT_FOUND;
     free(wsi);
     free(wdi);
     free(ww);
-
-    /* Initialize communities */
-    int *community = malloc(n * sizeof(int));
-    for (int i = 0; i < n; i++) {
-        community[i] = i;
-    }
-
-    if (total_weight == 0) {
-        cbm_louvain_result_t *result = malloc(n * sizeof(cbm_louvain_result_t));
-        for (int i = 0; i < n; i++) {
-            result[i].node_id = nodes[i];
-            result[i].community = i;
-        }
+    if (built != CBM_STORE_OK) {
+        /* No edges (or allocation failure): every node is its own community. */
         *out = result;
         *out_count = n;
-        free(community);
-        louvain_free_adj(adj, adj_w, adj_n, adj_cap, n);
         return CBM_STORE_OK;
     }
 
-    /* Compute node degrees */
-    double *degree = calloc(n, sizeof(double));
-    if (!degree) {
-        free(community);
-        louvain_free_adj(adj, adj_w, adj_n, adj_cap, n);
-        return CBM_NOT_FOUND;
-    }
+    double twom = 0.0;
     for (int i = 0; i < n; i++) {
-        if (adj_w[i]) {
-            for (int j = 0; j < adj_n[i]; j++) {
-                degree[i] += adj_w[i][j];
-            }
-        }
+        twom += g.k[i];
     }
 
-    /* Main Louvain loop (10 iterations max) */
-    for (int iter = 0; iter < ST_MAX_ITERATIONS; iter++) {
-        if (!louvain_iteration(n, adj, adj_w, adj_n, community, degree, total_weight, iter)) {
+    int *orig = malloc((size_t)n * sizeof(int)); /* original node -> current graph node */
+    int *comm = malloc((size_t)n * sizeof(int));
+    if (twom <= 0.0 || !orig || !comm) {
+        free(orig);
+        free(comm);
+        lg_free(&g);
+        *out = result;
+        *out_count = n;
+        return CBM_STORE_OK;
+    }
+    for (int i = 0; i < n; i++) {
+        orig[i] = i;
+        comm[i] = i;
+    }
+
+    for (int level = 0; level < LEIDEN_MAX_LEVELS; level++) {
+        leiden_move(&g, comm, gamma, twom);
+        int c_count = leiden_relabel(comm, g.n);
+        if (c_count >= g.n) {
+            break; /* every node already isolated — nothing to coarsen */
+        }
+        int *refined = malloc((size_t)g.n * sizeof(int));
+        if (!refined) {
             break;
         }
+        int r_count = leiden_refine(&g, comm, gamma, twom, refined);
+        if (r_count >= g.n) {
+            free(refined);
+            break; /* refinement cannot reduce the graph further */
+        }
+        for (int i = 0; i < n; i++) {
+            orig[i] = refined[orig[i]];
+        }
+        cbm_lg_t g2;
+        int *seed = malloc((size_t)r_count * sizeof(int));
+        if (!seed || leiden_aggregate(&g, refined, r_count, comm, &g2, seed) != CBM_STORE_OK) {
+            free(seed);
+            free(refined);
+            break;
+        }
+        free(refined);
+        lg_free(&g);
+        g = g2;
+        free(comm);
+        comm = seed;
     }
 
-    /* Build result */
-    cbm_louvain_result_t *result = malloc(n * sizeof(cbm_louvain_result_t));
     for (int i = 0; i < n; i++) {
-        result[i].node_id = nodes[i];
-        result[i].community = community[i];
+        result[i].community = comm[orig[i]];
     }
+    free(comm);
+    free(orig);
+    lg_free(&g);
     *out = result;
     *out_count = n;
-
-    free(community);
-    free(degree);
-    louvain_free_adj(adj, adj_w, adj_n, adj_cap, n);
     return CBM_STORE_OK;
+}
+
+int cbm_louvain(const int64_t *nodes, int node_count, const cbm_louvain_edge_t *edges,
+                int edge_count, cbm_louvain_result_t **out, int *out_count) {
+    return cbm_leiden(nodes, node_count, edges, edge_count, 1.0, out, out_count);
 }
 
 /* ── GetArchitecture dispatch ──────────────────────────────────── */
