@@ -299,6 +299,29 @@ TEST(extract_helm_templates_issue338) {
     PASS();
 }
 
+/* --- Helm values.yaml: top-level keys only, no leaf flood (#338) --- */
+TEST(extract_helm_values_toplevel_issue338) {
+    CBMFileResult *r = extract("image:\n"
+                               "  repository: nginx\n"
+                               "  tag: latest\n"
+                               "replicaCount: 3\n"
+                               "service:\n"
+                               "  port: 80\n",
+                               CBM_LANG_YAML, "chart", "values.yaml");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Variable", "image"));
+    ASSERT(has_def(r, "Variable", "replicaCount"));
+    ASSERT(has_def(r, "Variable", "service"));
+    /* Nested leaf keys must NOT explode into separate nodes. */
+    ASSERT(!has_def(r, "Variable", "repository"));
+    ASSERT(!has_def(r, "Variable", "tag"));
+    ASSERT(!has_def(r, "Variable", "port"));
+    ASSERT_EQ(count_defs_with_label(r, "Variable"), 3);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Java --- */
 TEST(java_class) {
     CBMFileResult *r = extract(
@@ -2577,6 +2600,7 @@ SUITE(extraction) {
     RUN_TEST(extract_cfscript_issue38);
     RUN_TEST(extract_cfml_tag_issue38);
     RUN_TEST(extract_helm_templates_issue338);
+    RUN_TEST(extract_helm_values_toplevel_issue338);
 
     /* OOP */
     RUN_TEST(java_class);

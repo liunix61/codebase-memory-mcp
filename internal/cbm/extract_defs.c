@@ -3297,8 +3297,69 @@ static void walk_variables_iter(CBMExtractCtx *ctx, TSNode root, const CBMLangSp
     }
 }
 
+// True if the file's basename is values.yaml / values.yml (Helm values, #338).
+static bool is_helm_values_file(const char *rel) {
+    if (!rel) {
+        return false;
+    }
+    const char *b = strrchr(rel, '/');
+    b = b ? b + 1 : rel;
+    return strcmp(b, "values.yaml") == 0 || strcmp(b, "values.yml") == 0;
+}
+
+// Extract ONLY top-level keys of a YAML document (no leaf explosion). Used for
+// Helm values.yaml so each chart's tunables surface as a handful of structured
+// Variables instead of one node per nested leaf (#338).
+static void extract_yaml_toplevel_keys(CBMExtractCtx *ctx, TSNode root) {
+    CBMArena *a = ctx->arena;
+    // Descend stream -> document -> block_node down to the first block_mapping.
+    TSNode bm = {0};
+    TSNode cur = root;
+    for (int depth = 0; depth < 6 && ts_node_is_null(bm); depth++) {
+        uint32_t n = ts_node_child_count(cur);
+        TSNode next = {0};
+        bool have_next = false;
+        for (uint32_t i = 0; i < n; i++) {
+            TSNode ch = ts_node_child(cur, i);
+            const char *ck = ts_node_type(ch);
+            if (strcmp(ck, "block_mapping") == 0) {
+                bm = ch;
+                break;
+            }
+            if (!have_next && (strcmp(ck, "document") == 0 || strcmp(ck, "block_node") == 0)) {
+                next = ch;
+                have_next = true;
+            }
+        }
+        if (!ts_node_is_null(bm) || !have_next) {
+            break;
+        }
+        cur = next;
+    }
+    if (ts_node_is_null(bm)) {
+        return;
+    }
+    uint32_t n = ts_node_named_child_count(bm);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode pair = ts_node_named_child(bm, i);
+        if (strcmp(ts_node_type(pair), "block_mapping_pair") != 0) {
+            continue;
+        }
+        TSNode key = ts_node_child_by_field_name(pair, TS_FIELD("key"));
+        if (!ts_node_is_null(key)) {
+            push_var_def(ctx, cbm_node_text(a, key, ctx->source), pair);
+        }
+    }
+}
+
 static void extract_variables(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec) {
     if (!spec->variable_node_types || !spec->variable_node_types[0]) {
+        return;
+    }
+
+    // Helm values.yaml: only top-level keys, not the per-leaf flood.
+    if (ctx->language == CBM_LANG_YAML && is_helm_values_file(ctx->rel_path)) {
+        extract_yaml_toplevel_keys(ctx, root);
         return;
     }
 
