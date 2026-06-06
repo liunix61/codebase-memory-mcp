@@ -27,7 +27,7 @@ void cbm_log_init_from_env(void) {
     static const char *const names[] = {"debug", "info", "warn", "error", "none"};
     char lower[8];
     size_t i = 0;
-    for (; raw[i] != '\0' && i < sizeof(lower) - 1; i++) {
+    for (; i < sizeof(lower) - 1 && raw[i] != '\0'; i++) {
         lower[i] = (char)tolower((unsigned char)raw[i]);
     }
     lower[i] = '\0';

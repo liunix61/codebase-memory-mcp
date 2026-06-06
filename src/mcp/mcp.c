@@ -2518,7 +2518,7 @@ static void add_excluded_summary(yyjson_mut_doc *doc, yyjson_mut_val *root, char
     }
     yyjson_mut_obj_add_val(doc, excluded, "dirs", dirs);
     yyjson_mut_obj_add_int(doc, excluded, "count", excluded_count);
-    yyjson_mut_obj_add_bool(doc, excluded, "truncated", excluded_count > shown);
+    yyjson_mut_obj_add_bool(doc, excluded, "truncated", excluded_count > INDEX_EXCLUDED_DIR_CAP);
     yyjson_mut_obj_add_val(doc, root, "excluded", excluded);
 }
 
